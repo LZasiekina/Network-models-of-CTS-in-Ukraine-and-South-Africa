@@ -1,0 +1,410 @@
+# Network Comparison Test: Ukraine vs South Africa
+# Van Borkulo et al. (2022), Psychological Methods, 28(6), 1273–1285
+#
+# The three steps of NCT, analyse observed data, create a reference distribution and evaluate significance
+#
+# Outputs:
+#   NCT_Figure1_NullDistributions.pdf   -- null distributions for M and S
+#   NCT_Figure2_SignificantEdges.pdf    -- significant edge differences (if any)
+#   NCT_EdgeResults_UKR_vs_SA.csv       -- full edge-level results table
+#   NCT_Summary_UKR_vs_SA.txt          -- plain-text summary of all results
+
+
+# 1. Packages
+
+required <- c("bootnet", "dplyr", "ggplot2")
+
+new_pkgs <- required[!required %in% installed.packages()[, "Package"]]
+if (length(new_pkgs) > 0) {
+  message("Installing: ", paste(new_pkgs, collapse = ", "))
+  install.packages(new_pkgs, dependencies = TRUE)
+}
+
+suppressPackageStartupMessages({
+  library(bootnet)
+  library(dplyr)
+  library(ggplot2)
+})
+
+
+# User settings
+
+DATA_PATH <- "SA_and_Ukraine_CTS_PHQ_GAD_CPSS.csv"  # path to your CSV
+N_PERM    <- 1000     # permutations for the reference distribution
+GAMMA     <- 0.5      # EBICglasso sparsity hyperparameter (0 = liberal, 0.5 = default)
+ALPHA     <- 0.05     # significance threshold
+SEED      <- 123      # for reproducibility
+
+
+# Load and prepare data
+
+if (!file.exists(DATA_PATH)) {
+  stop(
+    "Data file not found: '", DATA_PATH, "'\n",
+    "Set your working directory to the folder containing the CSV,\n",
+    "or update DATA_PATH above."
+  )
+}
+
+raw <- read.csv(DATA_PATH, stringsAsFactors = FALSE)
+message(sprintf("Data loaded: %d rows x %d columns", nrow(raw), ncol(raw)))
+
+# Identifying columns for each group by suffix
+ukr_cols <- grep("_UKR$", names(raw), value = TRUE)
+sa_cols  <- grep("_SA$",  names(raw), value = TRUE)
+stopifnot(length(ukr_cols) == length(sa_cols))
+
+# Stripping suffix so both data frames share identical column names (node labels)
+shared_labels         <- sub("_UKR$", "", ukr_cols)
+dat_ukr               <- raw[, ukr_cols];  colnames(dat_ukr) <- shared_labels
+dat_sa                <- raw[, sa_cols];   colnames(dat_sa)  <- shared_labels
+
+# Listwise deletion per group
+dat_ukr <- na.omit(dat_ukr)
+dat_sa  <- na.omit(dat_sa)
+
+n1 <- nrow(dat_ukr)   # Ukraine sample size
+n2 <- nrow(dat_sa)    # South Africa sample size
+
+message(sprintf("Complete cases  --  Ukraine: %d  |  South Africa: %d", n1, n2))
+
+# Upper-triangle index (i < j) for symmetric edge matrices
+p         <- length(shared_labels)
+upper_idx <- which(upper.tri(matrix(0, p, p)), arr.ind = TRUE)
+
+
+
+# 1. Analysing the Observed Data Sets
+#
+# (b) Calculating three observed test statistics:
+#
+#     M   = max_ij |omega1_ij - omega2_ij|
+#           Maximum absolute edge difference across all edges.
+#           Tests NETWORK STRUCTURE INVARIANCE (omnibus).
+#           H0: all edges are equal between groups.
+#
+#     S   = | sum(|omega1_ij|) - sum(|omega2_ij|) |
+#           Absolute difference in global strength (weighted edge sum).
+#           Tests GLOBAL STRENGTH INVARIANCE.
+#           H0: overall connectivity is equal between groups.
+#
+#     E_ij = |omega1_ij - omega2_ij|  for every edge pair (i,j)
+#           Individual absolute edge differences.
+#           Tests EDGE STRENGTH INVARIANCE (post-hoc, for each edge).
+#           H0: edge (i,j) is equal between groups.
+#
+
+message("\n=== STEP 1: Analyse observed data ===")
+
+# Estimate network structures
+
+message("  Estimating Ukraine network  (EBICglasso, gamma = ", GAMMA, ")")
+net_ukr <- suppressMessages(suppressWarnings(
+  estimateNetwork(
+    dat_ukr,
+    default   = "EBICglasso",
+    corMethod = "cor",
+    tuning    = GAMMA,
+    missing   = "pairwise"
+  )
+))
+
+message("  Estimating South Africa network  (EBICglasso, gamma = ", GAMMA, ")")
+net_sa <- suppressMessages(suppressWarnings(
+  estimateNetwork(
+    dat_sa,
+    default   = "EBICglasso",
+    corMethod = "cor",
+    tuning    = GAMMA,
+    missing   = "pairwise"
+  )
+))
+
+W1_obs <- net_ukr$graph   # p x p partial-correlation weight matrix: Ukraine
+W2_obs <- net_sa$graph    # p x p partial-correlation weight matrix: South Africa
+
+message("  Network Structure Estimation complete.")
+
+# Calculating observed test statistics
+
+message("  Calculating observed test statistics...")
+
+edge_diffs_obs <- abs(W1_obs[upper_idx] - W2_obs[upper_idx])
+
+# M: network structure invariance
+M_obs  <- max(edge_diffs_obs)
+
+# S: global strength invariance
+GS1_obs <- sum(abs(W1_obs[upper_idx]))
+GS2_obs <- sum(abs(W2_obs[upper_idx]))
+S_obs   <- abs(GS1_obs - GS2_obs)
+
+# E: per-edge statistics (stored as vector matching upper_idx rows)
+E_obs   <- edge_diffs_obs
+
+message(sprintf("  Observed Test Statistics Calculated."))
+message(sprintf("    Observed M = %.4f  (network structure)", M_obs))
+message(sprintf("    Observed S = %.4f  (global strength: UKR=%.4f, SA=%.4f)",
+                S_obs, GS1_obs, GS2_obs))
+
+
+
+# STEP 2 Creating the Reference Distribution
+
+message("\n=== STEP 2: Create reference distribution (", N_PERM, " permutations) ===")
+
+set.seed(SEED)
+
+# Pooling data sets
+
+pooled  <- rbind(dat_ukr, dat_sa)   # (n1 + n2) x p
+n_total <- nrow(pooled)
+
+message(sprintf("  Pooled data set: %d rows x %d columns", n_total, p))
+
+# Pre-allocate null-distribution storage
+M_null <- numeric(N_PERM)
+S_null <- numeric(N_PERM)
+E_null <- matrix(NA_real_, nrow = N_PERM, ncol = nrow(upper_idx))
+
+# Progress messages at every 10 %
+report_at <- floor(seq(0.1, 1.0, by = 0.1) * N_PERM)
+
+for (i in seq_len(N_PERM)) {
+  
+  # Progress report BEFORE the two estimations so output stays clean
+  if (i %in% report_at) {
+    message(sprintf("  Permutation %4d / %d  (%3.0f%%)", i, N_PERM,
+                    100 * i / N_PERM))
+  }
+  
+  # Resample without replacement 
+  perm_idx <- sample(n_total, size = n_total, replace = FALSE)
+  resamp1  <- pooled[perm_idx[seq_len(n1)], ]          # pseudo-group 1
+  resamp2  <- pooled[perm_idx[(n1 + 1):n_total], ]     # pseudo-group 2
+  
+  # Estimate networks on resampled data
+
+  W1_r <- suppressMessages(suppressWarnings(
+    estimateNetwork(resamp1, default = "EBICglasso",
+                    corMethod = "cor", tuning = GAMMA,
+                    missing = "pairwise")$graph
+  ))
+  W2_r <- suppressMessages(suppressWarnings(
+    estimateNetwork(resamp2, default = "EBICglasso",
+                    corMethod = "cor", tuning = GAMMA,
+                    missing = "pairwise")$graph
+  ))
+  
+  # Calculating test statistics on resampled networks
+  edge_diffs_r <- abs(W1_r[upper_idx] - W2_r[upper_idx])
+  
+  M_null[i]    <- max(edge_diffs_r)
+  S_null[i]    <- abs(sum(abs(W1_r[upper_idx])) - sum(abs(W2_r[upper_idx])))
+  E_null[i, ]  <- edge_diffs_r
+}
+
+message("  Step 2 complete. Reference distributions built.")
+
+
+# STEP 3: Evaluating Significance
+
+#
+# Compare each observed test statistic to its null distribution. The p-value is the proportion of null statistics that are at
+# least as extreme as the observed value
+#
+
+message("\n=== STEP 3: Evaluate significance ===")
+
+# p-values: proportion of null >= observed
+p_M <- mean(M_null >= M_obs)
+p_S <- mean(S_null >= S_obs)
+
+# Individual edge p-values
+n_edges    <- length(E_obs)
+p_edges    <- vapply(seq_len(n_edges),
+                     function(k) mean(E_null[, k] >= E_obs[k]),
+                     numeric(1))
+
+# Bonferroni correction threshold
+alpha_bonf <- ALPHA / n_edges
+
+# Bonferroni-Holm adjusted p-values for individual edges
+p_edges_holm <- p.adjust(p_edges, method = "holm")
+
+# Assemble edge results table
+edge_table <- data.frame(
+  Node1            = shared_labels[upper_idx[, 1]],
+  Node2            = shared_labels[upper_idx[, 2]],
+  Weight_UKR       = round(W1_obs[upper_idx], 4),
+  Weight_SA        = round(W2_obs[upper_idx], 4),
+  Observed_Diff    = round(E_obs, 4),
+  p_uncorrected    = round(p_edges, 4),
+  p_Holm           = round(p_edges_holm, 4),
+  Sig_uncorrected  = p_edges        < ALPHA,
+  Sig_Holm         = p_edges_holm   < ALPHA,
+  stringsAsFactors = FALSE
+)
+edge_table <- edge_table[order(edge_table$p_uncorrected), ]
+
+message("  Step 3 complete.")
+
+
+# Print full results to console 
+
+cat("\n", strrep("=", 70), "\n")
+cat("  NCT RESULTS: Ukraine vs South Africa\n")
+cat(strrep("=", 70), "\n\n")
+
+cat(sprintf("  Ukraine N = %d  |  South Africa N = %d\n", n1, n2))
+cat(sprintf("  Permutations = %d  |  gamma = %.2f  |  alpha = %.2f\n\n",
+            N_PERM, GAMMA, ALPHA))
+
+cat(strrep("-", 70), "\n")
+cat("STEP 3 RESULTS\n")
+cat(strrep("-", 70), "\n\n")
+
+# Network structure
+cat("(a) Network Structure Invariance (Omnibus Test)\n")
+cat(sprintf("    H0: all edge weights are equal across both networks\n"))
+cat(sprintf("    Observed M statistic  (max |omega1_ij - omega2_ij|): %.4f\n", M_obs))
+cat(sprintf("    Reference distribution: %d permuted M values\n", N_PERM))
+cat(sprintf("    p-value  (proportion of null M >= %.4f):  %.4f\n", M_obs, p_M))
+if (p_M < ALPHA) {
+  cat(sprintf("    *** SIGNIFICANT at alpha = %.2f ***\n", ALPHA))
+  cat("    At least one edge weight differs between Ukraine and South Africa.\n\n")
+} else {
+  cat(sprintf("    Non-significant at alpha = %.2f\n", ALPHA))
+  cat("    No reliable evidence of edge differences between networks.\n\n")
+}
+
+# Global strength
+cat("(b) Global Strength Invariance\n")
+cat(sprintf("    H0: sum(|omega_UKR|) = sum(|omega_SA|)\n"))
+cat(sprintf("    Global strength -- Ukraine:      %.4f\n", GS1_obs))
+cat(sprintf("    Global strength -- South Africa: %.4f\n", GS2_obs))
+cat(sprintf("    Observed S statistic (|GS1 - GS2|): %.4f\n", S_obs))
+cat(sprintf("    p-value  (proportion of null S >= %.4f):  %.4f\n", S_obs, p_S))
+if (p_S < ALPHA) {
+  cat(sprintf("    *** SIGNIFICANT at alpha = %.2f ***\n", ALPHA))
+  cat("    Overall connectivity (global strength) differs between groups.\n\n")
+} else {
+  cat(sprintf("    Non-significant at alpha = %.2f\n", ALPHA))
+  cat("    No reliable difference in overall connectivity.\n\n")
+}
+
+# Individual edge tests
+cat("(c) Individual Edge Strength Tests (Post-hoc)\n")
+cat(sprintf("    Total edges tested: %d\n", n_edges))
+cat(sprintf("    Bonferroni-corrected alpha: %.6f\n", alpha_bonf))
+cat(sprintf("    Holm-adjusted p-values also reported.\n\n"))
+
+sig_unc  <- edge_table[edge_table$Sig_uncorrected, ]
+sig_holm <- edge_table[edge_table$Sig_Holm, ]
+
+cat(sprintf("    Edges significant at uncorrected alpha = %.2f:  %d\n",
+            ALPHA, nrow(sig_unc)))
+if (nrow(sig_unc) > 0) {
+  print(sig_unc[, c("Node1", "Node2", "Weight_UKR", "Weight_SA",
+                    "Observed_Diff", "p_uncorrected", "p_Holm")],
+        row.names = FALSE)
+}
+
+cat(sprintf("\n    Edges significant after Bonferroni-Holm correction:  %d\n",
+            nrow(sig_holm)))
+if (nrow(sig_holm) > 0) {
+  print(sig_holm[, c("Node1", "Node2", "Weight_UKR", "Weight_SA",
+                     "Observed_Diff", "p_uncorrected", "p_Holm")],
+        row.names = FALSE)
+} else {
+  cat("    (none)\n")
+}
+cat("\n")
+
+
+# Saving Outputs
+
+write.csv(edge_table, "NCT_EdgeResults_UKR_vs_SA.csv", row.names = FALSE)
+message("Edge results saved to: NCT_EdgeResults_UKR_vs_SA.csv")
+
+# Summary text file
+sink("NCT_Summary_UKR_vs_SA.txt")
+cat("NCT RESULTS: Ukraine vs South Africa\n")
+cat(strrep("=", 70), "\n\n")
+cat(sprintf("Ukraine N = %d  |  South Africa N = %d\n", n1, n2))
+cat(sprintf("Permutations = %d  |  gamma = %.2f  |  alpha = %.2f\n\n",
+            N_PERM, GAMMA, ALPHA))
+cat("(a) Network structure  M =", round(M_obs, 4),
+    "  p =", round(p_M, 4), "\n")
+cat("(b) Global strength    S =", round(S_obs, 4),
+    "  p =", round(p_S, 4),
+    "  [GS_UKR =", round(GS1_obs, 4),
+    ", GS_SA =",  round(GS2_obs, 4), "]\n")
+cat("(c) Edges sig (uncorrected):", nrow(sig_unc),
+    "  |  Bonferroni-Holm:", nrow(sig_holm), "\n\n")
+cat("Full edge table (sorted by p_uncorrected):\n")
+print(edge_table, row.names = FALSE)
+sink()
+message("Text summary saved to: NCT_Summary_UKR_vs_SA.txt")
+
+
+# Figure 1: Null distributions with observed statistic marked
+
+pdf("NCT_Figure1_NullDistributions.pdf", width = 12, height = 5)
+par(mfrow = c(1, 2))
+
+hist(M_null, breaks = 50, col = "lightsteelblue", border = "white",
+     main = "STEP 3: Network Structure Invariance\nNull Distribution (M)",
+     xlab = "M statistic (max edge difference)", las = 1, freq = FALSE,
+     xlim = range(c(M_null, M_obs)))
+abline(v = M_obs, col = "#D32F2F", lwd = 2.5, lty = 2)
+legend("topright",
+       legend = sprintf("Observed M = %.4f\np = %.4f", M_obs, p_M),
+       bty = "n", text.col = "#D32F2F", cex = 0.95)
+
+hist(S_null, breaks = 50, col = "lightsteelblue", border = "white",
+     main = "STEP 3: Global Strength Invariance\nNull Distribution (S)",
+     xlab = "S statistic (|GS_UKR - GS_SA|)", las = 1, freq = FALSE,
+     xlim = range(c(S_null, S_obs)))
+abline(v = S_obs, col = "#D32F2F", lwd = 2.5, lty = 2)
+legend("topright",
+       legend = sprintf("Observed S = %.4f\np = %.4f", S_obs, p_S),
+       bty = "n", text.col = "#D32F2F", cex = 0.95)
+dev.off()
+message("Null distribution figure saved to: NCT_Figure1_NullDistributions.pdf")
+
+
+# Figure 2: Significant edges (if any)
+
+if (nrow(sig_unc) > 0) {
+  top_edges <- head(edge_table[edge_table$Sig_uncorrected, ], 30)
+  top_edges$Edge <- paste(top_edges$Node1, "-", top_edges$Node2)
+  
+  p3 <- ggplot(top_edges,
+               aes(x = reorder(Edge, Observed_Diff),
+                   y = Observed_Diff,
+                   fill = Sig_Holm)) +
+    geom_col() +
+    scale_fill_manual(values = c("TRUE" = "#D32F2F", "FALSE" = "#90A4AE"),
+                      labels = c("TRUE" = "Bonferroni-Holm significant",
+                                 "FALSE" = "Uncorrected alpha only"),
+                      name = NULL) +
+    coord_flip() +
+    labs(title = "STEP 3: Significant Edge Differences",
+         subtitle = "Ukraine vs South Africa (post-hoc edge tests)",
+         x = NULL, y = "|Weight_UKR - Weight_SA|") +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "bottom")
+  
+  ggsave("NCT_Figure2_SignificantEdges.pdf", p3,
+         width = 9, height = max(4, nrow(top_edges) * 0.4))
+  message("Significant edges figure saved to: NCT_Figure2_SignificantEdges.pdf")
+}
+
+
+# Session info
+
+cat("\n", strrep("-", 70), "\n")
+cat("Session info\n")
+cat(strrep("-", 70), "\n")
+print(sessionInfo())

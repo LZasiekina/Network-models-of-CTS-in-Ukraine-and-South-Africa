@@ -1,0 +1,432 @@
+
+# Item-Level Symptom Network Analysis (Ukraine Sample)
+# GGM with EBICglasso regularisation, packages: bootnet, qgraph
+
+
+# 1. Installing & loading packages
+
+packages <- c("bootnet", "qgraph", "dplyr", "tidyr")
+
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE,
+                     repos = "https://cloud.r-project.org")
+  }
+}
+
+invisible(lapply(packages, install_if_missing))
+
+library(bootnet)
+library(qgraph)
+library(dplyr)
+
+
+# 2. Loading data
+
+setwd("C:/Users/maech/OneDrive/Documents/Third Year Exeter/Dissertation 3rd Year/Ukranian Adolescents Network Analysis")
+# Set path to your CSV file
+data_path <- "Data_Ukraine_CTSR_GAD_PHQ_CPSS.csv"
+
+df <- read.csv(data_path, header = TRUE, stringsAsFactors = FALSE)
+
+cat("Data dimensions:", nrow(df), "rows x", ncol(df), "columns\n")
+cat("Variables:", paste(names(df), collapse = ", "), "\n\n")
+
+# 3. Selecting and ordering variables
+# CTS (orange), GAD (green), PHQ (pink), CPSS (blue)
+
+cts_vars  <- grep("^A_CTSR_", names(df), value = TRUE)
+gad_vars  <- grep("^A_GAD_",  names(df), value = TRUE)
+phq_vars  <- grep("^A_PHQ_",  names(df), value = TRUE)
+cpss_vars <- grep("^A_CPSS_", names(df), value = TRUE)
+
+cat("CTS items :", length(cts_vars),  "\n")
+cat("GAD items :", length(gad_vars),  "\n")
+cat("PHQ items :", length(phq_vars),  "\n")
+cat("CPSS items:", length(cpss_vars), "\n\n")
+
+# Order: GAD, CTS, PHQ, CPSS
+node_order <- c(gad_vars, cts_vars, phq_vars, cpss_vars)
+
+# Select data
+data_net <- df[, node_order]
+
+# Remove rows with all NA
+data_net <- data_net[rowSums(is.na(data_net)) < ncol(data_net), ]
+
+cat("Rows after removing all-NA rows:", nrow(data_net), "\n\n")
+
+
+# 4. Defining node groups and colours
+
+n_gad  <- length(gad_vars)
+n_cts  <- length(cts_vars)
+n_phq  <- length(phq_vars)
+n_cpss <- length(cpss_vars)
+
+groups <- c(
+  rep("Anxiety (GAD)",    n_gad),
+  rep("CTS",              n_cts),
+  rep("Depression (PHQ)", n_phq),
+  rep("PTSD (CPSS)",      n_cpss)
+)
+
+group_colours <- c(
+  "Anxiety (GAD)"    = "#66C266",   # Green
+  "CTS"              = "#F4A0B0",   # Pink
+  "Depression (PHQ)" = "#6AAFE6",   # Blue
+  "PTSD (CPSS)"      = "#F4A929"    # Orange
+)
+
+node_colours <- group_colours[groups]
+
+
+# 5. Creating node labels (remove "A_" prefix from dataset)
+
+
+make_label <- function(varname) {
+  # Remove leading "A_" only
+  sub("^A_", "", varname)
+}
+
+node_labels <- sapply(node_order, make_label)
+
+
+# 6. Estimating GGM with EBICglasso via bootnet
+
+cat("Estimating GGM network (EBICglasso) ...\n")
+
+set.seed(42)
+network <- estimateNetwork(
+  data        = data_net,
+  default     = "EBICglasso",
+  corMethod   = "cor",          # Pearson; use "spearman" for ordinal if preferred
+  tuning      = 0.5,            # EBIC hyperparameter (γ = 0.5 is standard)
+  missing     = "pairwise",
+  verbose     = TRUE
+)
+
+cat("\nNetwork estimated successfully.\n")
+cat("Number of non-zero edges:",
+    sum(network$graph[upper.tri(network$graph)] != 0), "\n\n")
+
+
+# 7. Plotting the network
+
+# Build group list for qgraph legend
+group_list <- list(
+  "PTSD (CPSS)"      = which(groups == "PTSD (CPSS)"),
+  "Depression (PHQ)" = which(groups == "Depression (PHQ)"),
+  "Anxiety (GAD)"    = which(groups == "Anxiety (GAD)"),
+  "CTS"              = which(groups == "CTS")
+)
+
+# Save to PDF
+pdf("Ukraine_Symptom_Network.pdf", width = 16, height = 9)
+
+qgraph(
+  network$graph,
+  layout        = "spring",          # force-directed layout
+  labels        = node_labels,
+  label.cex     = 0.95,
+  label.color   = "black",
+  color         = node_colours,
+  #groups        = group_list,
+  legend        = FALSE,
+  legend.cex    = 0.55,
+  legend.mode   = "style2",
+  GLratio       = 1.8,               # graph-to-legend width ratio
+  nodeNames     = node_labels,
+  # Edge styling
+  posCol        = "#333333",         # positive edges: dark grey
+  negCol        = "#E05050",         # negative edges: red
+  edge.width    = 2.3,
+  minimum       = 0,                 # show all non-zero edges
+  maximum       = 1,
+  cut           = 0,
+  # Node styling
+  vsize         = 6,
+  border.width  = 1.2,
+  border.color  = "white",
+  # Title
+  title         = "Item-Level Symptom Network (Ukraine Adolescents)",
+  title.cex     = 1.4
+)
+
+# Add manual legend
+legend(
+  "topright",
+  legend = c("PTSD (CPSS)", "Depression (PHQ)", "Anxiety (GAD)", "CTS (CTSR)"),
+  fill   = c("#F4A929", "#6AAFE6", "#66C266", "#F4A0B0"),
+  border = "white",
+  bty    = "n",        # no box around legend
+  cex    = 1.3
+)
+
+dev.off()
+cat("Network plot saved to: Ukraine_Symptom_Network.pdf\n\n")
+
+# Also save as PNG
+png("Ukraine_Symptom_Network.png", width = 1800, height = 1000, res = 120)
+
+qgraph(
+  network$graph,
+  layout        = "spring",
+  labels        = node_labels,
+  label.cex     = 0.95,
+  label.color   = "black",
+  color         = node_colours,
+  groups        = group_list,
+  legend        = FALSE,
+  legend.cex    = 0.55,
+  legend.mode   = "style2",
+  GLratio       = 1.8,
+  nodeNames     = node_labels,
+  posCol        = "#333333",
+  negCol        = "#E05050",
+  edge.width    = 2.3,
+  minimum       = 0,
+  maximum       = 1,
+  cut           = 0,
+  vsize         = 6,
+  border.width  = 1.2,
+  border.color  = "white",
+  title         = "Item-Level Symptom Network (Ukraine Adolescents)",
+  title.cex     = 1.4
+)
+
+# Add manual legend
+legend(
+  "topright",
+  legend = c("PTSD (CPSS)", "Depression (PHQ)", "Anxiety (GAD)", "CTS (CTSR)"),
+  fill   = c("#F4A929", "#6AAFE6", "#66C266", "#F4A0B0"),
+  border = "white",
+  bty    = "n",        # no box around legend
+  cex    = 1.3
+)
+
+dev.off()
+cat("Network plot saved to: Ukraine_Symptom_Network.png\n\n")
+
+
+# 8. Network descriptive statistics
+
+cat("=== Network Descriptive Statistics ===\n\n")
+
+# Edge weight matrix
+W <- network$graph
+
+# Strength (sum of absolute edge weights for each node)
+strength <- colSums(abs(W))
+cat("Node Strength (top 10):\n")
+print(round(sort(strength, decreasing = TRUE)[1:10], 3))
+
+# Density
+n_nodes   <- ncol(W)
+max_edges <- n_nodes * (n_nodes - 1) / 2
+n_edges   <- sum(W[upper.tri(W)] != 0)
+density   <- n_edges / max_edges
+cat(sprintf("\nDensity: %.3f (%d / %d possible edges)\n", density, n_edges, max_edges))
+
+# Edge weight summary
+edge_weights <- W[upper.tri(W)]
+nonzero_edges <- edge_weights[edge_weights != 0]
+cat(sprintf("\nNon-zero edge weights (n=%d):\n", length(nonzero_edges)))
+print(summary(nonzero_edges))
+
+
+
+# 9. Stability analysis (bootstrap)
+#     Uncomment to run — takes several minutes
+
+#cat("Running bootstrap stability analysis (n=1000)...\n")
+#boot_nonparam <- bootnet(network, nBoots = 1000, nCores = 4)
+#boot_casedrop <- bootnet(network, nBoots = 1000, nCores = 4,
+#                          type = "case", statistics = c("strength", "closeness", "betweenness"))
+
+#pdf("Ukraine_Bootstrap_EdgeAccuracy.pdf", width = 12, height = 8)
+#plot(boot_nonparam, labels = FALSE, order = "sample")
+#dev.off()
+
+#pdf("Ukraine_Bootstrap_CentralityStability.pdf", width = 10, height = 8)
+#plot(boot_casedrop, statistics = c("strength", "closeness", "betweenness"))
+#dev.off()
+
+#cs_strength    <- corStability(boot_casedrop, statistics = "strength")
+#cs_closeness   <- corStability(boot_casedrop, statistics = "closeness")
+#cs_betweenness <- corStability(boot_casedrop, statistics = "betweenness")
+#cat("CS-coefficient (Strength)   :", cs_strength, "\n")
+#cat("CS-coefficient (Closeness)  :", cs_closeness, "\n")
+#cat("CS-coefficient (Betweenness):", cs_betweenness, "\n")
+
+#cat("\n=== Analysis complete! ===\n")
+#cat("Output files:\n")
+#cat("  - Ukraine_Symptom_Network.pdf\n")
+#cat("  - Ukraine_Symptom_Network.png\n")
+#cat("  - Ukraine_Centrality_Plot.pdf\n")
+
+
+# START OF BRIDGING ANALYSIS CODE FOR DISSERTATION: 
+# Identifing CTS and non-CTS indices
+
+
+cts_indices <- which(groups == "CTS")
+non_cts_indices <- which(groups != "CTS")
+
+W <- network$graph
+
+
+# Computing maximum cross-domain edge for each CTS item
+
+  cts_bridge <- sapply(cts_indices, function(i) {
+  max(abs(W[i, non_cts_indices]))
+})
+
+# Create dataframe
+bridge_df <- data.frame(
+  CTS_Item = node_labels[cts_indices],
+  Max_Cross_Domain_Edge = cts_bridge
+)
+
+# Sort descending
+bridge_df <- bridge_df[order(-bridge_df$Max_Cross_Domain_Edge), ]
+
+print(bridge_df)
+
+
+# Identify top 3 and bottom 3
+
+
+bridge_df$Category <- "Middle"
+
+n_items <- nrow(bridge_df)
+
+bridge_df$Category[1:3] <- "Top 3"
+bridge_df$Category[(n_items-2):n_items] <- "Bottom 3"
+
+# Reverse order for horizontal plot
+bridge_df$CTS_Item <- factor(
+  bridge_df$CTS_Item,
+  levels = rev(bridge_df$CTS_Item)
+)
+
+
+# Plotting Bridging Analysis
+
+library(ggplot2)
+
+png("Ukraine_CTS_Bridging_Symptoms_TopBottom3.png",
+    width = 1400, height = 800, res = 120)
+
+ggplot(bridge_df,
+       aes(x = Max_Cross_Domain_Edge,
+           y = CTS_Item,
+           fill = Category)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = round(Max_Cross_Domain_Edge, 3)),
+            hjust = -0.2,
+            size = 5) +
+  scale_fill_manual(
+    values = c(
+      "Top 3" = "#E53935",
+      "Middle" = "#F4A929",
+      "Bottom 3" = "#1E88E5"
+    ),
+    breaks = c("Top 3", "Middle", "Bottom 3")
+  ) +
+  labs(title = "CTS Bridging Symptoms - Ukraine (Partial Correlation)",
+       x = "Maximum Cross-Domain Edge",
+       y = "CTS Item") +
+  theme_minimal(base_size = 17) +
+  theme(plot.title = element_text(
+    margin = margin(b = 20)
+  )) +
+  scale_x_continuous(limits = c(0, max(bridge_df$Max_Cross_Domain_Edge) + 0.04))
+
+dev.off()
+
+cat("\nBridging plot saved as: Ukraine_CTS_Bridging_Symptoms_TopBottom3.png\n")
+
+
+
+# FULL CTS CROSS-DOMAIN EDGE EXTRACTION
+
+
+# Defining domain indices
+ptsd_indices <- which(groups == "PTSD (CPSS)")
+phq_indices  <- which(groups == "Depression (PHQ)")
+gad_indices  <- which(groups == "Anxiety (GAD)")
+
+
+# Extracting ALL non-zero edges between two sets
+
+extract_edges <- function(mat, rows, cols, row_labels, col_labels, domain_name) {
+  
+  submat <- mat[rows, cols]
+  
+  edge_list <- which(submat != 0, arr.ind = TRUE)
+  
+  if (nrow(edge_list) == 0) {
+    return(NULL)
+  }
+  
+  data.frame(
+    CTS_Item   = row_labels[rows][edge_list[,1]],
+    Connected_To = col_labels[cols][edge_list[,2]],
+    Weight     = submat[edge_list],
+    Abs_Weight = abs(submat[edge_list]),
+    Domain     = domain_name
+  )
+}
+
+
+# Extracting all bridges
+
+cts_ptsd_edges <- extract_edges(
+  W,
+  cts_indices,
+  ptsd_indices,
+  node_labels,
+  node_labels,
+  "PTSD"
+)
+
+cts_phq_edges <- extract_edges(
+  W,
+  cts_indices,
+  phq_indices,
+  node_labels,
+  node_labels,
+  "Depression"
+)
+
+cts_gad_edges <- extract_edges(
+  W,
+  cts_indices,
+  gad_indices,
+  node_labels,
+  node_labels,
+  "Anxiety"
+)
+
+# Combining into one dataframe
+all_cts_bridges <- rbind(cts_ptsd_edges,
+                         cts_phq_edges,
+                         cts_gad_edges)
+
+# Sorting by absolute weight (strongest first)
+all_cts_bridges <- all_cts_bridges[order(-all_cts_bridges$Abs_Weight), ]
+
+# Print results
+cat("\n====================================================\n")
+cat("ALL CTS CROSS-DOMAIN BRIDGES (sorted by strength)\n")
+cat("====================================================\n\n")
+
+print(all_cts_bridges)
+
+# Save to CSV
+write.csv(all_cts_bridges,
+          "Ukraine_CTS_CrossDomain_Edges.csv",
+          row.names = FALSE)
+
+cat("\nSaved full bridge table to: Ukraine_All_CTS_CrossDomain_Edges.csv\n")
